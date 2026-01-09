@@ -1,0 +1,166 @@
+# Example Asimov ledger configuration for p_astro analysis
+#
+# This example shows how to set up a p_astro calculation that depends
+# on a prior parameter estimation (PE) analysis.
+
+kind: analysis
+name: "GW150914_pastro_example"
+pipeline: "pastro"
+
+# The p_astro pipeline depends on a completed PE analysis
+# that provides posterior samples
+needs:
+  - "GW150914_bilby_pe"  # Name of the PE production
+
+# Event information
+event:
+  name: "GW150914"
+  gps_time: 1126259462.4
+
+# Interferometers used in the analysis
+interferometers:
+  - H1
+  - L1
+
+# Scheduler configuration for HTCondor
+scheduler:
+  request_memory: "2GB"
+  request_disk: "1GB"
+  request_cpus: "1"
+  accounting_group: "ligo.dev.o4.cbc.pe.bayesian"
+
+# Optional: If you want to use Omicron glitch information
+# Add a dependency on an Omicron analysis
+# needs:
+#   - "GW150914_bilby_pe"
+#   - "GW150914_omicron"
+
+---
+
+# Complete example with PE analysis included
+# This shows the full workflow from PE to p_astro
+
+kind: analysis
+name: "GW150914_bilby_pe"
+pipeline: "bilby"
+status: "complete"  # Assuming this has already run
+
+event:
+  name: "GW150914"
+  gps_time: 1126259462.4
+
+interferometers:
+  - H1
+  - L1
+
+# ... bilby PE configuration ...
+
+---
+
+kind: analysis
+name: "GW150914_pastro"
+pipeline: "pastro"
+
+# This analysis will automatically find the posterior samples
+# from GW150914_bilby_pe
+needs:
+  - "GW150914_bilby_pe"
+
+event:
+  name: "GW150914"
+  gps_time: 1126259462.4
+
+interferometers:
+  - H1
+  - L1
+
+scheduler:
+  request_memory: "2GB"
+  request_disk: "1GB"
+  accounting_group: "ligo.dev.o4.cbc.pe.bayesian"
+
+---
+
+# Example with Omicron glitch characterization included
+
+kind: analysis
+name: "GW151216_omicron"
+pipeline: "pyomicron"
+status: "complete"
+
+event:
+  name: "GW151216"
+  gps_time: 1134293073.0
+
+data:
+  gps-start-time: 1134293053.0  # 20s before event
+  gps-end-time: 1134293093.0    # 20s after event
+  channels:
+    H1: "H1:GDS-CALIB_STRAIN"
+    L1: "L1:GDS-CALIB_STRAIN"
+  frametype: "H1_HOFT_C00"
+
+omicron:
+  frequency-range: "4.0 2048.0"
+  snr-threshold: 5.0
+
+---
+
+kind: analysis
+name: "GW151216_bilby_pe"
+pipeline: "bilby"
+status: "complete"
+
+event:
+  name: "GW151216"
+  gps_time: 1134293073.0
+
+interferometers:
+  - H1
+  - L1
+
+# ... bilby configuration ...
+
+---
+
+kind: analysis
+name: "GW151216_pastro"
+pipeline: "pastro"
+
+# Depends on both PE and Omicron analyses
+needs:
+  - "GW151216_bilby_pe"    # For posterior samples
+  - "GW151216_omicron"     # For glitch characterization
+
+event:
+  name: "GW151216"
+  gps_time: 1134293073.0
+
+interferometers:
+  - H1
+  - L1
+
+scheduler:
+  request_memory: "2GB"
+  request_disk: "1GB"
+  accounting_group: "ligo.dev.o4.cbc.pe.bayesian"
+
+---
+
+# Example for multi-event project analysis
+# This would analyze p_astro values across multiple events
+
+kind: project_analysis
+name: "O3_pastro_population"
+pipeline: "pastro"
+
+# Subject to all events in the project
+subjects: all
+
+# Filter to only completed PE analyses
+analyses:
+  - pipeline: "bilby"
+    status: "complete"
+
+# This would aggregate p_astro results across all events
+# for population-level studies
