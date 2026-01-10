@@ -127,9 +127,8 @@ class Pastro(asimov.pipeline.Pipeline):
         """
         Compute signal coherence across detectors.
 
-        This is a placeholder for the coherence calculation described
-        in the papers. It should compare signal parameters across IFOs
-        to determine consistency.
+        Compares signal parameters across IFOs to determine if they're
+        consistent with a single astrophysical source.
 
         Parameters
         ----------
@@ -139,24 +138,18 @@ class Pastro(asimov.pipeline.Pipeline):
         Returns
         -------
         dict
-            Coherence metrics (time delays, amplitude ratios, phase consistency, etc.)
+            Coherence metrics (time delays, amplitude ratios, network SNR, etc.)
         """
+        from .coherence import compute_coherence as compute_coherence_impl
+
         self.logger.info("Computing signal coherence across detectors")
 
-        # TODO: Implement coherence calculations
-        # - Compare arrival times across IFOs
-        # - Check amplitude consistency given antenna patterns
-        # - Verify phase relationships
-        # - Compute network SNR vs individual SNRs
+        # Get IFOs from production metadata
+        ifos = self.interferometers
 
-        coherence_metrics = {
-            'time_delay_consistency': None,
-            'amplitude_consistency': None,
-            'phase_consistency': None,
-            'network_snr': None,
-        }
+        # Call the implementation
+        coherence_metrics = compute_coherence_impl(samples, ifos, self.logger)
 
-        self.logger.warning("Coherence calculation not yet implemented")
         return coherence_metrics
 
     def compute_pastro(self, samples, coherence, glitch_triggers=None):

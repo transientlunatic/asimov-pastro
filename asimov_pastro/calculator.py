@@ -125,7 +125,7 @@ class PastroCalculator:
 
     def _load_hdf5_samples(self, filepath):
         """
-        Load samples from HDF5 file (bilby or pycbc format).
+        Load samples from HDF5 file (bilby, pycbc, or PESummary format).
 
         Parameters
         ----------
@@ -154,12 +154,26 @@ class PastroCalculator:
                 for key in group.keys():
                     samples[key] = np.array(group[key])
 
-            # Try RIFT format or other
+            # Try PESummary format (GWTC files)
+            # Structure: [label]/posterior_samples (structured array)
             else:
-                # Just read all datasets at top level
+                # Look for groups that might contain posterior_samples
                 for key in f.keys():
-                    if isinstance(f[key], h5py.Dataset):
-                        samples[key] = np.array(f[key])
+                    if isinstance(f[key], h5py.Group):
+                        group = f[key]
+                        if 'posterior_samples' in group:
+                            # Structured array format
+                            posterior = group['posterior_samples']
+                            # Extract each field
+                            for field in posterior.dtype.names:
+                                samples[field] = np.array(posterior[field])
+                            break
+
+                # If still no samples, try top-level datasets
+                if not samples:
+                    for key in f.keys():
+                        if isinstance(f[key], h5py.Dataset):
+                            samples[key] = np.array(f[key])
 
         if not samples:
             raise ValueError(f"Could not parse HDF5 file: {filepath}")
@@ -190,7 +204,7 @@ class PastroCalculator:
 
         return samples
 
-    def compute_coherence(self, samples):
+    def compute_coherence(self, samples, ifos=None):
         """
         Compute signal coherence metrics across detectors.
 
@@ -201,6 +215,9 @@ class PastroCalculator:
         ----------
         samples : dict
             Posterior samples
+        ifos : list of str, optional
+            List of interferometers (e.g., ['H1', 'L1'])
+            If not provided, will try to infer from samples
 
         Returns
         -------
@@ -208,19 +225,28 @@ class PastroCalculator:
             Coherence metrics including:
             - time_delay_consistency: coherence in arrival times
             - amplitude_consistency: coherence in amplitudes
-            - phase_consistency: coherence in phases
             - network_snr: combined network SNR
+            - overall_coherence: combined metric
         """
-        # TODO: Implement actual coherence calculations
-        # This is a key component of the p_astro calculation
+        from .coherence import compute_coherence as compute_coherence_impl
 
-        coherence = {
-            'time_delay_consistency': None,
-            'amplitude_consistency': None,
-            'phase_consistency': None,
-            'network_snr': None,
-            'implemented': False,
-        }
+        # Infer IFOs if not provided
+        if ifos is None:
+            # Try to infer from sample parameter names
+            # Look for IFO-specific parameters (e.g., H1_optimal_snr, H1_time, etc.)
+            possible_ifos = ['H1', 'L1', 'V1', 'K1']
+            ifos = []
+            for ifo in possible_ifos:
+                # Check if any parameter contains this IFO name
+                if any(ifo in key for key in samples.keys()):
+                    ifos.append(ifo)
+
+            # Default to H1, L1 if can't infer
+            if not ifos:
+                ifos = ['H1', 'L1']
+
+        # Call the implementation
+        coherence = compute_coherence_impl(samples, ifos, self.logger)
 
         return coherence
 

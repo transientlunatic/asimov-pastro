@@ -15,6 +15,7 @@ dependencies = [
     "scipy>=1.7",
     "h5py>=3.0",
     "gwpy>=3.0",
+    "click>=8.0",
 ]
 
 [project.optional-dependencies]
@@ -23,8 +24,15 @@ dev = [
     "pytest-cov>=3.0",
 ]
 
+[project.scripts]
+asimov-pastro = "asimov_pastro_cli:cli"
+
 [project.entry-points."asimov.pipelines"]
 pastro = "asimov_pastro:Pastro"
 
+[project.scripts]
+asimov-pastro-coherence = "asimov_pastro.cli:coherence_cmd"
+
 [tool.setuptools]
 packages = ["asimov_pastro"]
+py-modules = ["asimov_pastro_cli"]
