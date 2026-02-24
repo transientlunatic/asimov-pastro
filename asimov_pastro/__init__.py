@@ -2,405 +2,453 @@
 Asimov pipeline for computing astrophysical probability (p_astro) of
 gravitational wave candidates.
 
-This pipeline implements the Bayesian framework described in:
-- arXiv:1909.11872 - Gravitational wave detection without boot straps
-- arXiv:2006.05039 - The astrophysical odds of GW151216
+Implements the Bayesian framework from:
+  Ashton, Thrane & Smith (2019)  arXiv:1909.11872
+  Ashton & Thrane (2020)         arXiv:2006.05039
 
-The pipeline can consume posterior samples from any parameter estimation
-tool (bilby, pycbc_inference, RIFT, etc.) and compute the probability
-that a candidate is of astrophysical origin vs. terrestrial noise.
+Expected upstream dependencies (declared in the blueprint via ``needs``):
+
+* **Per-IFO PE runs** — one bilby analysis per detector, run incoherently.
+  Each must advertise a ``"samples"`` asset (bilby result HDF5 file).
+  The IFOs present are detected automatically from the posterior parameters.
+* **Coherent PE run** — a multi-IFO bilby analysis.
+  Also advertised as ``"samples"``; distinguished by having >1 IFO.
+* **pyomicron run** (optional) — advertises a ``"trigger list"`` asset
+  mapping IFO codes to lists of Omicron trigger files.
+
+Blueprint configuration (under the ``pastro`` key):
+
+.. code-block:: yaml
+
+    pastro:
+      merger_rate: 28.3        # R, Gpc^-3 yr^-1
+      sensitive_volume: 1.5    # V_T, Gpc^3
+      segment_duration: 0.2    # delta-T, seconds (default 0.2)
+      approximant: C01:IMRPhenomXPHM  # only needed for PESummary input files
+      context_duration: 86400  # Omicron trigger window, seconds (default 24 h)
+      default_xi_g: 0.01       # fallback glitch probability if no triggers available
 """
 
-import os
-import glob
 import json
-from pathlib import Path
+import os
 
-import asimov.pipeline
-from asimov.utils import set_directory
+try:
+    import asimov.pipeline
+    from asimov.utils import set_directory
+    from asimov import config as asimov_config
+except (ImportError, ModuleNotFoundError):
+    asimov = None
+    asimov_config = None
+
+from .evidence import detect_ifos_in_bilby_result, read_evidence
+from .odds import compute_log_noise_evidence, compute_pastro, compute_xi, compute_xi_g_from_triggers
 
 try:
     import htcondor2 as htcondor
-    import classad2 as classad
 except ImportError:
-    import htcondor
-    import classad
+    try:
+        import htcondor
+    except ImportError:
+        htcondor = None
 
-from asimov import config
+
+_DEFAULT_SEGMENT_DURATION = 0.2    # seconds
+_DEFAULT_CONTEXT_DURATION = 86400  # 24 hours, as used in arXiv:2006.05039
+_DEFAULT_XI_G = 0.01               # conservative fallback glitch probability
 
 
-class Pastro(asimov.pipeline.Pipeline):
+_Pipeline = asimov.pipeline.Pipeline if asimov is not None else object
+
+
+class Pastro(_Pipeline):
     """
     Asimov pipeline for computing p_astro (astrophysical probability).
 
-    This pipeline:
-    1. Ingests posterior samples from any PE pipeline (bilby, pycbc, etc.)
-    2. Optionally ingests Omicron glitch triggers for noise characterization
-    3. Computes signal coherence across detectors
-    4. Calculates Bayesian odds: P(astrophysical) / P(terrestrial)
-    5. Outputs p_astro value and diagnostic information
-
-    The pipeline is agnostic to the source of posterior samples and can
-    work with outputs from bilby_pipe, pycbc_inference, RIFT, or any
-    other parameter estimation tool that produces standard formats.
+    See module docstring for usage details.
     """
 
     name = "pastro"
 
     def __init__(self, production, category=None):
-        """
-        Initialize the p_astro pipeline.
-
-        Parameters
-        ----------
-        production : asimov.Production
-            The production object containing analysis metadata
-        category : str, optional
-            The category of this analysis
-        """
         super().__init__(production, category)
-        self.logger.info(f"Initializing p_astro pipeline for {production.name}")
+        self.logger.info(
+            f"Initialising p_astro pipeline for {production.name}"
+        )
+
+    # ------------------------------------------------------------------
+    # Configuration helpers
+    # ------------------------------------------------------------------
 
     @property
-    def interferometers(self):
-        """Get list of interferometers for this analysis."""
-        ifos = self.production.meta.get("interferometers", [])
-        if isinstance(ifos, dict):
-            return list(ifos.keys())
-        return ifos
+    def _pastro_config(self):
+        return self.production.meta.get("pastro", {})
 
-    def get_pe_samples(self):
+    @property
+    def merger_rate(self):
+        return float(self._pastro_config["merger_rate"])
+
+    @property
+    def sensitive_volume(self):
+        return float(self._pastro_config["sensitive_volume"])
+
+    @property
+    def segment_duration(self):
+        return float(
+            self._pastro_config.get("segment_duration", _DEFAULT_SEGMENT_DURATION)
+        )
+
+    @property
+    def context_duration(self):
+        return float(
+            self._pastro_config.get("context_duration", _DEFAULT_CONTEXT_DURATION)
+        )
+
+    @property
+    def approximant(self):
+        return self._pastro_config.get("approximant", None)
+
+    @property
+    def default_xi_g(self):
+        return float(
+            self._pastro_config.get("default_xi_g", _DEFAULT_XI_G)
+        )
+
+    # ------------------------------------------------------------------
+    # Asset retrieval from upstream dependencies
+    # ------------------------------------------------------------------
+
+    def _get_all_pe_sample_files(self):
+        """Return all HDF5/JSON sample files from upstream PE dependencies."""
+        assets = self.production._previous_assets()
+        sample_files = assets.get("samples", [])
+        if isinstance(sample_files, str):
+            sample_files = [sample_files]
+        return [f for f in sample_files if f.endswith((".hdf5", ".h5", ".json"))]
+
+    def _partition_pe_files(self, sample_files):
         """
-        Retrieve posterior samples from dependent PE analyses.
+        Split PE result files into one coherent file and per-IFO files.
 
-        This method is agnostic to the PE tool used - it can read
-        samples from bilby, pycbc, RIFT, or any other pipeline.
+        Uses :func:`~asimov_pastro.evidence.detect_ifos_in_bilby_result` to
+        inspect each file.  The file with the largest IFO set is taken as the
+        coherent result; files with exactly one IFO are taken as single-detector
+        results.
 
         Returns
         -------
-        list of str
-            Paths to posterior sample files
+        coherent_file : str or None
+        per_ifo_files : dict mapping IFO code to file path
         """
-        dependencies = self.production._previous_assets()
-        sample_files = dependencies.get('samples', [])
+        ifo_map = {}  # file -> list of IFOs
+        for f in sample_files:
+            try:
+                ifos = detect_ifos_in_bilby_result(f)
+            except Exception as e:
+                self.logger.warning(
+                    f"Could not detect IFOs in {f}: {e} — skipping"
+                )
+                continue
+            if ifos:
+                ifo_map[f] = ifos
 
-        if not sample_files:
-            self.logger.warning("No posterior samples found in dependencies")
-            return []
+        if not ifo_map:
+            return None, {}
 
-        self.logger.info(f"Found {len(sample_files)} posterior sample file(s)")
-        for sample_file in sample_files:
-            self.logger.info(f"  - {sample_file}")
+        # Coherent file: most IFOs
+        coherent_file = max(ifo_map, key=lambda f: len(ifo_map[f]))
+        coherent_ifos = ifo_map[coherent_file]
 
-        return sample_files
+        per_ifo_files = {}
+        for f, ifos in ifo_map.items():
+            if f == coherent_file:
+                continue
+            if len(ifos) == 1:
+                per_ifo_files[ifos[0]] = f
+            else:
+                self.logger.warning(
+                    f"{f} has {ifos} IFOs but is not the coherent file — ignoring"
+                )
 
-    def get_omicron_triggers(self):
-        """
-        Retrieve Omicron glitch triggers if available.
+        self.logger.info(
+            f"Coherent PE file ({coherent_ifos}): {coherent_file}"
+        )
+        for ifo, f in per_ifo_files.items():
+            self.logger.info(f"Single-IFO PE file ({ifo}): {f}")
 
-        Returns
-        -------
-        dict or None
-            Dictionary mapping IFOs to trigger files, or None if not available
-        """
-        dependencies = self.production._previous_assets()
+        return coherent_file, per_ifo_files
 
-        # Look for Omicron outputs in various formats
-        omicron_triggers = {}
-
-        # Check for direct omicron trigger files
-        if 'omicron_triggers' in dependencies:
-            omicron_triggers = dependencies['omicron_triggers']
-
-        # Check for generic trigger files
-        elif 'triggers' in dependencies:
-            omicron_triggers = dependencies['triggers']
-
-        if omicron_triggers:
-            self.logger.info(f"Found Omicron triggers for IFOs: {list(omicron_triggers.keys())}")
+    def _get_trigger_list(self):
+        """Return the Omicron trigger list from upstream assets, or None."""
+        assets = self.production._previous_assets()
+        trigger_list = assets.get("trigger list", None)
+        if trigger_list:
+            self.logger.info(
+                f"Found Omicron triggers for IFOs: {list(trigger_list.keys())}"
+            )
         else:
-            self.logger.info("No Omicron triggers found (optional)")
+            self.logger.info(
+                "No Omicron trigger list found — will use default xi_g"
+            )
+        return trigger_list
 
-        return omicron_triggers if omicron_triggers else None
+    # ------------------------------------------------------------------
+    # Core calculation
+    # ------------------------------------------------------------------
 
-    def compute_coherence(self, samples):
+    def run_calculation(self):
         """
-        Compute signal coherence across detectors.
+        Perform the p_astro calculation and return results as a dict.
 
-        Compares signal parameters across IFOs to determine if they're
-        consistent with a single astrophysical source.
-
-        Parameters
-        ----------
-        samples : dict
-            Posterior samples organized by parameter
+        This method is called from the HTCondor job script.  It is also
+        usable directly (e.g. in tests) without an HTCondor environment.
 
         Returns
         -------
-        dict
-            Coherence metrics (time delays, amplitude ratios, network SNR, etc.)
+        dict with keys:
+            ``p_astro``, ``log_odds``, ``log_Z_S``, ``log_Z_N``, ``xi``,
+            ``xi_g``, ``ifos``, ``log_evidence_coherent``,
+            ``log_noise_evidence_per_ifo``.
         """
-        from .coherence import compute_coherence as compute_coherence_impl
+        # --- locate and classify PE result files -------------------------
+        sample_files = self._get_all_pe_sample_files()
+        if not sample_files:
+            raise RuntimeError(
+                "No PE sample files found in upstream dependencies. "
+                "Ensure coherent and per-IFO bilby analyses are listed "
+                "in the blueprint 'needs' field and have completed."
+            )
 
-        self.logger.info("Computing signal coherence across detectors")
+        coherent_file, per_ifo_files = self._partition_pe_files(sample_files)
 
-        # Get IFOs from production metadata
-        ifos = self.interferometers
+        if coherent_file is None:
+            raise RuntimeError(
+                "Could not identify a coherent (multi-IFO) PE result file. "
+                "Check that the coherent bilby analysis has completed and "
+                "that its result file is being advertised."
+            )
+        if not per_ifo_files:
+            raise RuntimeError(
+                "No single-IFO PE result files found. "
+                "Ensure per-IFO bilby analyses are listed in 'needs' and "
+                "have completed."
+            )
 
-        # Call the implementation
-        coherence_metrics = compute_coherence_impl(samples, ifos, self.logger)
+        ifos = sorted(per_ifo_files.keys())
+        self.logger.info(f"IFOs for noise model: {ifos}")
 
-        return coherence_metrics
+        # --- read evidences ----------------------------------------------
+        self.logger.info("Reading coherent evidence from PE result file")
+        coherent_ev = read_evidence(coherent_file, label=self.approximant)
+        log_Z_S = coherent_ev["log_evidence"]
+        self.logger.info(f"  log Z_S = {log_Z_S:.3f}")
 
-    def compute_pastro(self, samples, coherence, glitch_triggers=None):
-        """
-        Compute the astrophysical probability using Bayesian odds.
+        log_Z_glitch = {}
+        log_Z_gaussian = {}
+        for ifo, f in per_ifo_files.items():
+            self.logger.info(f"Reading single-IFO evidence for {ifo}")
+            ev = read_evidence(f, label=self.approximant)
+            log_Z_glitch[ifo] = ev["log_evidence"]
+            log_Z_gaussian[ifo] = ev["log_noise_evidence"]
+            self.logger.info(
+                f"  {ifo}: log Z_glitch = {log_Z_glitch[ifo]:.3f}, "
+                f"log Z_gaussian = {log_Z_gaussian[ifo]:.3f}"
+            )
 
-        Implements the method from arXiv:1909.11872 and arXiv:2006.05039:
+        # --- xi: prior signal probability --------------------------------
+        xi = compute_xi(self.merger_rate, self.sensitive_volume, self.segment_duration)
+        self.logger.info(
+            f"xi = {xi:.3e}  "
+            f"(R={self.merger_rate} Gpc^-3 yr^-1, "
+            f"V={self.sensitive_volume} Gpc^3, "
+            f"dT={self.segment_duration} s)"
+        )
 
-        p_astro = 1 / (1 + O_N^A)
+        # --- xi_g: per-detector glitch probability -----------------------
+        trigger_list = self._get_trigger_list()
+        if trigger_list:
+            xi_g = compute_xi_g_from_triggers(
+                trigger_list, self.context_duration, self.segment_duration
+            )
+            # Ensure we have xi_g for every IFO in the noise model
+            for ifo in ifos:
+                if ifo not in xi_g:
+                    self.logger.warning(
+                        f"No triggers found for {ifo} — using default xi_g"
+                    )
+                    xi_g[ifo] = self.default_xi_g
+        else:
+            xi_g = {ifo: self.default_xi_g for ifo in ifos}
 
-        where O_N^A is the odds ratio of terrestrial noise to astrophysical signal.
+        for ifo in ifos:
+            self.logger.info(f"  xi_g[{ifo}] = {xi_g[ifo]:.3e}")
 
-        Parameters
-        ----------
-        samples : dict
-            Posterior samples from PE analysis
-        coherence : dict
-            Coherence metrics from compute_coherence()
-        glitch_triggers : dict, optional
-            Omicron trigger information for noise characterization
+        # --- noise evidence (Eq. 9) --------------------------------------
+        log_Z_N = compute_log_noise_evidence(
+            ifos, log_Z_glitch, log_Z_gaussian, xi_g
+        )
+        self.logger.info(f"log Z_N = {log_Z_N:.3f}")
 
-        Returns
-        -------
-        float
-            The astrophysical probability (0 to 1)
-        """
-        self.logger.info("Computing p_astro using Bayesian odds")
+        # --- p_astro -----------------------------------------------------
+        p_astro, log_odds = compute_pastro(log_Z_S, log_Z_N, xi)
+        self.logger.info(f"log odds = {log_odds:.3f}")
+        self.logger.info(f"p_astro  = {p_astro:.6f}")
 
-        # TODO: Implement full Bayesian calculation
-        # 1. Model astrophysical signal hypothesis (coherent signal)
-        # 2. Model terrestrial noise hypothesis (glitches, incoherent)
-        # 3. Compute likelihood ratio
-        # 4. Convert to probability
+        return {
+            "p_astro": p_astro,
+            "log_odds": log_odds,
+            "log_Z_S": log_Z_S,
+            "log_Z_N": log_Z_N,
+            "xi": xi,
+            "xi_g": xi_g,
+            "ifos": ifos,
+            "log_evidence_per_ifo": log_Z_glitch,
+            "log_noise_evidence_per_ifo": log_Z_gaussian,
+            "inputs": {
+                "merger_rate": self.merger_rate,
+                "sensitive_volume": self.sensitive_volume,
+                "segment_duration": self.segment_duration,
+                "context_duration": self.context_duration,
+                "coherent_file": coherent_file,
+                "per_ifo_files": per_ifo_files,
+            },
+        }
 
-        # Placeholder: return 0.5 (maximum uncertainty)
-        pastro = 0.5
-
-        self.logger.warning("p_astro calculation not yet implemented, returning placeholder")
-        return pastro
+    # ------------------------------------------------------------------
+    # HTCondor job management
+    # ------------------------------------------------------------------
 
     def build_dag(self, dryrun=False):
         """
-        Build the HTCondor job for p_astro calculation.
-
-        Parameters
-        ----------
-        dryrun : bool
-            If True, don't actually submit the job
+        Write the calculation script and HTCondor submit file.
         """
         self.logger.info("Building p_astro calculation job")
-
         name = self.production.name
         rundir = self.production.rundir
+        os.makedirs(rundir, exist_ok=True)
 
-        # Get input data
-        sample_files = self.get_pe_samples()
-        omicron_triggers = self.get_omicron_triggers()
+        # Write a small driver script that imports and calls run_calculation
+        script_path = os.path.join(rundir, f"{name}_pastro.py")
+        script = f"""\
+#!/usr/bin/env python
+# Auto-generated by asimov-pastro — do not edit by hand.
+import json, logging, sys
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(levelname)s %(message)s')
 
-        if not sample_files:
-            raise ValueError("No posterior samples available for p_astro calculation")
+from asimov.ledger import Ledger
+from asimov.event import Event
 
-        # Create a Python script that will run the calculation
-        script_path = os.path.join(rundir, f"{name}_calculate_pastro.py")
+ledger = Ledger("{self.production.event.repository.directory}")
+event = Event.from_ledger(ledger, "{self.production.event.name}")
+production = event.get_production("{self.production.name}")
+pipeline = production.pipeline
 
-        script_content = f"""#!/usr/bin/env python
-\"\"\"
-P_astro calculation script for {name}
-Generated by asimov-pastro pipeline
-\"\"\"
+results = pipeline.run_calculation()
 
-import sys
-import json
-from asimov_pastro.calculator import PastroCalculator
+with open("pastro_results.json", "w") as fh:
+    json.dump(results, fh, indent=2)
 
-# Input files
-sample_files = {sample_files}
-omicron_triggers = {omicron_triggers}
-
-# Run calculation
-calculator = PastroCalculator()
-results = calculator.calculate(
-    sample_files=sample_files,
-    omicron_triggers=omicron_triggers,
-)
-
-# Save results
-with open('pastro_results.json', 'w') as f:
-    json.dump(results, f, indent=2)
-
-print(f"p_astro = {{results['pastro']:.4f}}")
+print(f"p_astro = {{results['p_astro']:.6f}}")
 sys.exit(0)
 """
-
-        os.makedirs(rundir, exist_ok=True)
-        with open(script_path, 'w') as f:
-            f.write(script_content)
+        with open(script_path, "w") as fh:
+            fh.write(script)
         os.chmod(script_path, 0o755)
 
-        # Build HTCondor submit description
-        executable = script_path
-
+        scheduler_meta = self.production.meta.get("scheduler", {})
         description = {
-            "executable": executable,
-            "output": f"{name}.out",
-            "error": f"{name}.err",
-            "log": f"{name}.log",
-            "request_disk": self.production.meta.get("scheduler", {}).get("request disk", "1GB"),
-            "request_memory": self.production.meta.get("scheduler", {}).get("request memory", "2GB"),
-            "request_cpus": self.production.meta.get("scheduler", {}).get("cpus", "1"),
+            "executable": script_path,
+            "output": os.path.join(rundir, f"{name}.out"),
+            "error": os.path.join(rundir, f"{name}.err"),
+            "log": os.path.join(rundir, f"{name}.log"),
+            "request_disk": scheduler_meta.get("request disk", "1GB"),
+            "request_memory": scheduler_meta.get("request memory", "2GB"),
+            "request_cpus": str(scheduler_meta.get("cpus", 1)),
             "batch_name": f"pastro/{name}",
             "+flock_local": "True",
         }
 
-        # Add accounting group if provided
-        accounting_group = self.production.meta.get("scheduler", {}).get("accounting group", None)
+        accounting_group = scheduler_meta.get("accounting group")
         if accounting_group:
-            description["accounting_group_user"] = config.get("condor", "user")
+            description["accounting_group_user"] = asimov_config.get("condor", "user")
             description["accounting_group"] = accounting_group
 
         self.job = htcondor.Submit(description)
 
         with set_directory(rundir):
-            with open(f"{name}.sub", "w") as subfile:
-                subfile.write(self.job.__str__())
+            with open(f"{name}.sub", "w") as fh:
+                fh.write(str(self.job))
 
-        self.logger.info(f"HTCondor job description created at {rundir}/{name}.sub")
+        self.logger.info(f"HTCondor submit file written to {rundir}/{name}.sub")
 
     def submit_dag(self, dryrun=False):
-        """
-        Submit the p_astro calculation job to HTCondor.
-
-        Parameters
-        ----------
-        dryrun : bool
-            If True, don't actually submit the job
-
-        Returns
-        -------
-        int
-            HTCondor cluster ID
-        """
+        """Submit the p_astro job to HTCondor."""
         if dryrun:
-            self.logger.info("Dry run mode - not submitting job")
+            self.logger.info("Dry run — not submitting")
             return -1
-
-        self.logger.info("Submitting p_astro job to HTCondor")
 
         with set_directory(self.production.rundir):
             try:
                 schedd = htcondor.Schedd()
-            except:
+            except Exception:
                 schedulers = htcondor.Collector().locate(
                     htcondor.DaemonTypes.Schedd,
-                    config.get("condor", "scheduler")
+                    asimov_config.get("condor", "scheduler"),
                 )
                 schedd = htcondor.Schedd(schedulers)
 
             result = schedd.submit(self.job)
             cluster_id = result.cluster()
 
-            self.logger.info(f"Submitted job {cluster_id} to HTCondor")
-
         self.production.job_id = int(cluster_id)
         self.production.status = "running"
-
+        self.logger.info(f"Submitted HTCondor job {cluster_id}")
         return cluster_id
 
     def detect_completion(self):
-        """
-        Check if the p_astro calculation has completed.
-
-        Returns
-        -------
-        bool
-            True if the job has completed successfully
-        """
-        rundir = self.production.rundir
-        results_file = os.path.join(rundir, "pastro_results.json")
-
+        """Return True when ``pastro_results.json`` exists in the run directory."""
+        results_file = os.path.join(self.production.rundir, "pastro_results.json")
         if os.path.exists(results_file):
-            self.logger.info("P_astro calculation completed - results file found")
+            self.logger.info("p_astro results file found — job complete")
             return True
-
         return False
 
     def collect_assets(self):
-        """
-        Collect output files from the p_astro calculation.
-
-        Returns
-        -------
-        dict
-            Dictionary of output files and results
-        """
+        """Return a dict of output assets, including the results JSON."""
         rundir = self.production.rundir
         assets = {}
 
-        # Main results file
         results_file = os.path.join(rundir, "pastro_results.json")
         if os.path.exists(results_file):
-            assets['pastro_results'] = results_file
-
-            # Load and log the p_astro value
+            assets["pastro results"] = results_file
             try:
-                with open(results_file, 'r') as f:
-                    results = json.load(f)
-                    pastro = results.get('pastro', None)
-                    if pastro is not None:
-                        self.logger.info(f"p_astro = {pastro:.4f}")
-                        self.production.meta['pastro'] = pastro
+                with open(results_file) as fh:
+                    results = json.load(fh)
+                p_astro = results.get("p_astro")
+                if p_astro is not None:
+                    self.logger.info(f"p_astro = {p_astro:.6f}")
+                    self.production.meta["p_astro"] = p_astro
             except Exception as e:
-                self.logger.error(f"Failed to read results: {e}")
-
-        # Look for diagnostic plots
-        plot_files = glob.glob(os.path.join(rundir, "*.png"))
-        if plot_files:
-            assets['plots'] = plot_files
+                self.logger.error(f"Failed to read results file: {e}")
 
         return assets
 
     def collect_logs(self):
-        """
-        Collect log files from the job.
-
-        Returns
-        -------
-        dict
-            Dictionary of log file contents
-        """
+        """Return contents of HTCondor log files."""
         rundir = self.production.rundir
         name = self.production.name
         logs = {}
-
-        for ext in ['out', 'err', 'log']:
-            log_file = os.path.join(rundir, f"{name}.{ext}")
-            if os.path.exists(log_file):
-                with open(log_file, 'r') as f:
-                    logs[ext] = f.read()
-
+        for ext in ("out", "err", "log"):
+            path = os.path.join(rundir, f"{name}.{ext}")
+            if os.path.exists(path):
+                with open(path) as fh:
+                    logs[ext] = fh.read()
         return logs
 
     def after_completion(self):
-        """
-        Post-processing after successful completion.
-        """
-        self.logger.info("P_astro calculation completed successfully")
+        """Post-processing hook: store results in production metadata."""
         self.production.status = "finished"
-
-        # Store results in production metadata
         assets = self.collect_assets()
-        if 'pastro_results' in assets:
-            with open(assets['pastro_results'], 'r') as f:
-                results = json.load(f)
-                self.production.meta['pastro_results'] = results
+        if "pastro results" in assets:
+            with open(assets["pastro results"]) as fh:
+                self.production.meta["pastro_results"] = json.load(fh)
